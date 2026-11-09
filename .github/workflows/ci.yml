@@ -61,6 +61,7 @@ jobs:
         run: |
           for dir in kubernetes/environments/dev kubernetes/monitoring kubernetes/platform; do
             kustomize build "$dir"
+            echo '---'
           done | kubeconform -strict -ignore-missing-schemas -kubernetes-version 1.35.0 -summary -
   infrastructure:
     runs-on: ubuntu-latest
