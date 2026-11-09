@@ -1,0 +1,20 @@
+apiVersion: argoproj.io/v1alpha1
+kind: AppProject
+metadata:
+  name: stocklane
+  namespace: argocd
+spec:
+  description: Every Stocklane workload and platform add-on
+  sourceRepos:
+  - https://github.com/bawantha395/stocklane-aws-gitops-mlops-llmops-platform.git
+  - https://aws.github.io/eks-charts
+  - https://charts.external-secrets.io
+  - https://kubernetes-sigs.github.io/metrics-server
+  - https://prometheus-community.github.io/helm-charts
+  - https://grafana.github.io/helm-charts
+  destinations:
+  - server: https://kubernetes.default.svc
+    namespace: '*'
+  clusterResourceWhitelist:
+  - group: '*'
+    kind: '*'

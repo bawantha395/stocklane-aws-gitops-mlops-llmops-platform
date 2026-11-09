@@ -1,0 +1,95 @@
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: inventory
+  labels:
+    stocklane.io/monitoring: enabled
+    release: kube-prometheus-stack
+  namespace: stocklane-dev
+spec:
+  selector:
+    matchLabels:
+      app: inventory
+  endpoints:
+  - port: http
+    path: /actuator/prometheus
+    authorization:
+      type: Bearer
+      credentials:
+        name: inventory-secrets
+        key: INTERNAL_TOKEN
+  namespaceSelector:
+    matchNames:
+    - stocklane-dev
+---
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: workshop
+  labels:
+    stocklane.io/monitoring: enabled
+    release: kube-prometheus-stack
+  namespace: stocklane-dev
+spec:
+  selector:
+    matchLabels:
+      app: workshop
+  endpoints:
+  - port: http
+    path: /actuator/prometheus
+    authorization:
+      type: Bearer
+      credentials:
+        name: workshop-secrets
+        key: INTERNAL_TOKEN
+  namespaceSelector:
+    matchNames:
+    - stocklane-dev
+---
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: vision
+  labels:
+    stocklane.io/monitoring: enabled
+    release: kube-prometheus-stack
+  namespace: stocklane-dev
+spec:
+  selector:
+    matchLabels:
+      app: vision
+  endpoints:
+  - port: http
+    path: /metrics
+    authorization:
+      type: Bearer
+      credentials:
+        name: vision-secrets
+        key: INTERNAL_TOKEN
+  namespaceSelector:
+    matchNames:
+    - stocklane-dev
+---
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: forecast
+  labels:
+    stocklane.io/monitoring: enabled
+    release: kube-prometheus-stack
+  namespace: stocklane-dev
+spec:
+  selector:
+    matchLabels:
+      app: forecast
+  endpoints:
+  - port: http
+    path: /metrics
+    authorization:
+      type: Bearer
+      credentials:
+        name: forecast-secrets
+        key: INTERNAL_TOKEN
+  namespaceSelector:
+    matchNames:
+    - stocklane-dev

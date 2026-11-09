@@ -1,0 +1,32 @@
+# Dev environment. The Deploy workflow writes configmap.yaml, ingress-patch.yaml and the images
+# block (kustomize edit set image); everything else is reviewed by hand.
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+namespace: stocklane-dev
+resources:
+- ../../base
+- namespace.yaml
+- configmap.yaml
+patches:
+- path: ingress-patch.yaml
+  target: {kind: Ingress, name: api}
+images:
+- name: stocklane/inventory
+  newName: REPLACE_REGISTRY/inventory
+  newTag: unreleased
+- name: stocklane/workshop
+  newName: REPLACE_REGISTRY/workshop
+  newTag: unreleased
+- name: stocklane/vision
+  newName: REPLACE_REGISTRY/vision
+  newTag: unreleased
+- name: stocklane/forecast
+  newName: REPLACE_REGISTRY/forecast
+  newTag: unreleased
+- name: stocklane/operations
+  newName: REPLACE_REGISTRY/operations
+  newTag: unreleased
+labels:
+- pairs:
+    stocklane.io/environment: dev
+  includeSelectors: false

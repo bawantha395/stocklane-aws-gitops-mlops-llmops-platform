@@ -1,0 +1,23 @@
+# Created once by the bootstrap job. After that Argo CD manages everything in argocd/apps.
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: stocklane-root
+  namespace: argocd
+spec:
+  project: stocklane
+  source:
+    repoURL: https://github.com/bawantha395/stocklane-aws-gitops-mlops-llmops-platform.git
+    targetRevision: main
+    path: kubernetes/argocd/apps
+    directory:
+      recurse: false
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: argocd
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true
+    syncOptions:
+    - ServerSideApply=true

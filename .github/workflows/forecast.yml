@@ -1,0 +1,90 @@
+name: Nightly stock forecast
+on:
+  # Every night at 02:00 Asia/Colombo (20:30 UTC), after the app exports its history at 01:30.
+  schedule:
+    - cron: '30 20 * * *'
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: Environment
+        type: choice
+        options: [dev]
+        default: dev
+      publish:
+        description: Publish the forecast (items that fail their back-test are left out)
+        required: true
+        type: boolean
+        default: true
+permissions:
+  contents: read
+  id-token: write
+env:
+  AWS_AUTH_MODE: ${{ vars.AWS_AUTH_MODE || 'oidc' }}
+  AWS_REGION: ap-southeast-2
+  AWS_DEFAULT_REGION: ap-southeast-2
+  AWS_ACCOUNT_ID: ${{ vars.AWS_ACCOUNT_ID }}
+jobs:
+  forecast:
+    if: github.ref == 'refs/heads/main'
+    strategy:
+      fail-fast: false
+      # Scheduled runs cover every environment; environments that are not deployed are skipped.
+      matrix:
+        environment: ${{ fromJSON(github.event_name == 'schedule' && '["dev"]' || format('["{0}"]', inputs.environment)) }}
+    concurrency:
+      group: stock-forecast-${{ matrix.environment }}
+      cancel-in-progress: false
+    runs-on: ubuntu-latest
+    environment: aws-training
+    timeout-minutes: 30
+    env:
+      PROJECT_NAME: stocklane-${{ matrix.environment }}
+      TF_ENVIRONMENT: ${{ matrix.environment }}
+      SCHEDULED: ${{ github.event_name == 'schedule' }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with: {python-version: '3.12'}
+      - uses: ./.github/actions/aws-credentials
+        id: aws
+        continue-on-error: ${{ github.event_name == 'schedule' }}
+        with:
+          role: github-training
+          access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+      - name: Install the forecasting model runtime (CPU only)
+        run: |
+          pip install torch==2.9.1 --index-url https://download.pytorch.org/whl/cpu
+          pip install -r mlops/forecast/requirements.txt
+      - name: Check the environment is deployed
+        id: deployed
+        env:
+          AWS_READY: ${{ steps.aws.outcome }}
+        run: |
+          if [ "$AWS_READY" = "success" ] && mkdir -p artifacts && aws s3 cp "s3://${PROJECT_NAME}-automation-${AWS_ACCOUNT_ID}/outputs/dev/current.json" artifacts/aws.json --quiet; then
+            echo "ready=true" >> "$GITHUB_OUTPUT"
+          elif [ "$SCHEDULED" = "true" ]; then
+            echo "ready=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::$TF_ENVIRONMENT is not deployed (or has no credentials); nightly forecast skipped."
+          else
+            exit 1
+          fi
+      - name: Forecast with Chronos-Bolt, back-test and publish
+        if: steps.deployed.outputs.ready == 'true'
+        env:
+          # Nightly runs always publish: each item's back-test decides whether its forecast is used.
+          PUBLISH_FORECAST: ${{ github.event_name == 'schedule' || inputs.publish }}
+        run: |
+          args=()
+          if [ "$PUBLISH_FORECAST" = "true" ]; then args+=(--publish); fi
+          python mlops/forecast/run_forecast.py --config artifacts/aws.json "${args[@]}"
+      - name: Publish forecast summary
+        if: success() && steps.deployed.outputs.ready == 'true'
+        run: |
+          python - <<'PYCODE'
+          import json,os
+          report=json.load(open('artifacts/forecast-report.json'))
+          with open(os.environ['GITHUB_STEP_SUMMARY'],'a') as f:
+              f.write('## Stock forecast result ('+os.environ['TF_ENVIRONMENT']+')\n\n```json\n'+json.dumps(report,indent=2)+'\n```\n')
+              f.write('Items whose back-test failed, or with too little history, use the reorder-level rule. No stock was changed.\n')
+          PYCODE

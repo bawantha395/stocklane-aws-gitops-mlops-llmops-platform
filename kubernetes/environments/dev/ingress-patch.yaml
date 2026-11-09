@@ -1,0 +1,7 @@
+# Written by the Deploy workflow: this account's API hostname and certificate.
+- op: replace
+  path: /spec/rules/0/host
+  value: REPLACE_API_DOMAIN
+- op: add
+  path: /metadata/annotations/alb.ingress.kubernetes.io~1certificate-arn
+  value: REPLACE_API_CERTIFICATE_ARN

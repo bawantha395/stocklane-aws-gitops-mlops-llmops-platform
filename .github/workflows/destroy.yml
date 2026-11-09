@@ -1,0 +1,159 @@
+# Removes everything Deploy created so nothing keeps billing.
+#
+#   confirm ─► platform teardown ─► sweep ─► terraform destroy ─► sweep ─► check
+#
+#   platform teardown  CodeBuild inside the VPC stops Argo CD and deletes the ingresses and
+#                      volumes so the load balancer controller removes its ALBs and disks
+#   sweep              deletes what Kubernetes made outside Terraform (ALBs, target groups,
+#                      security groups, disks, DNS aliases) and old model versions
+#   check              fails if anything billable is still there
+# Kept: the foundation stacks (state bucket, CI roles) and your Route 53 hosted zone.
+name: Destroy environment
+on:
+  workflow_dispatch:
+    inputs:
+      confirm:
+        description: Type dev to confirm
+        type: string
+        required: true
+permissions:
+  contents: read
+  id-token: write
+concurrency:
+  group: stocklane-aws
+  cancel-in-progress: false
+env:
+  AWS_REGION: ap-southeast-2
+  AWS_DEFAULT_REGION: ap-southeast-2
+  AWS_AUTH_MODE: ${{ vars.AWS_AUTH_MODE || 'oidc' }}
+  AWS_ACCOUNT_ID: ${{ vars.AWS_ACCOUNT_ID }}
+  PROJECT_NAME: stocklane-dev
+  TF_DIR: infra/terraform/environments/dev
+jobs:
+  confirm:
+    runs-on: ubuntu-latest
+    permissions: {}
+    steps:
+      - name: Check the confirmation
+        env:
+          CONFIRM: ${{ inputs.confirm }}
+        run: test "$CONFIRM" = "dev" || { echo "::error::Type dev in confirm"; exit 1; }
+
+  teardown:
+    needs: confirm
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 75
+    environment: aws-platform
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: ./.github/actions/aws-credentials
+        with:
+          role: github-platform
+          access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+      - name: Stop Argo CD and release load balancers and volumes (inside the VPC)
+        run: |
+          automation="${PROJECT_NAME}-automation-${AWS_ACCOUNT_ID}"
+          if ! aws s3 cp "s3://$automation/outputs/dev/current.json" /tmp/outputs.json 2>/dev/null; then
+            echo "No deployment outputs found; there is no cluster to clean up."; exit 0
+          fi
+          project=$(jq -r .deployment.value.platform_bootstrap_project /tmp/outputs.json)
+          git archive --format=zip -o /tmp/source.zip HEAD
+          mkdir -p /tmp/extra/deploy/generated && cp /tmp/outputs.json /tmp/extra/deploy/generated/aws.outputs.json
+          (cd /tmp/extra && zip -qr /tmp/source.zip deploy)
+          key="sources/dev/teardown-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}.zip"
+          version=$(aws s3api put-object --bucket "$automation" --key "$key" --body /tmp/source.zip --server-side-encryption AES256 --query VersionId --output text)
+          build=$(aws codebuild start-build --project-name "$project" --source-type-override S3 \
+            --source-location-override "$automation/$key" --source-version "$version" \
+            --environment-variables-override "name=STOCKLANE_OPERATION,value=teardown,type=PLAINTEXT" \
+            --query build.id --output text)
+          for _ in $(seq 1 280); do
+            status=$(aws codebuild batch-get-builds --ids "$build" --query 'builds[0].buildStatus' --output text)
+            case $status in
+              SUCCEEDED) echo "Load balancers and volumes released"; exit 0;;
+              FAILED|FAULT|STOPPED|TIMED_OUT) echo "::warning::Teardown $status; the AWS sweep removes what is left"; exit 0;;
+            esac
+            sleep 15
+          done
+          aws codebuild stop-build --id "$build" >/dev/null
+
+  destroy:
+    needs: teardown
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    environment: aws-infrastructure-apply
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: hashicorp/setup-terraform@b9cd54a3c349d3f38e8881555d616ced269862dd # v3.1.2
+        with: {terraform_version: '1.13.5', terraform_wrapper: false}
+      - uses: ./.github/actions/aws-credentials
+        with:
+          role: ci-apply
+          access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+      - uses: ./.github/actions/terraform
+        with:
+          tfvars-json: ${{ secrets.TFVARS_JSON }}
+      - name: Delete old model versions (a Model Registry group must be empty)
+        run: |
+          for arn in $(aws sagemaker list-model-packages --model-package-group-name "${PROJECT_NAME}-visual-sku" \
+                         --query 'ModelPackageSummaryList[].ModelPackageArn' --output text 2>/dev/null); do
+            aws sagemaker delete-model-package --model-package-name "$arn"
+          done
+      - name: Sweep what Kubernetes created outside Terraform
+        env:
+          TFVARS_JSON: ${{ secrets.TFVARS_JSON }}
+        run: |
+          sweep() {
+            for arn in $(aws resourcegroupstaggingapi get-resources --resource-type-filters elasticloadbalancing:loadbalancer \
+                           --tag-filters "Key=elbv2.k8s.aws/cluster,Values=$PROJECT_NAME" --query 'ResourceTagMappingList[].ResourceARN' --output text); do
+              aws elbv2 modify-load-balancer-attributes --load-balancer-arn "$arn" --attributes Key=deletion_protection.enabled,Value=false >/dev/null || true
+              aws elbv2 delete-load-balancer --load-balancer-arn "$arn" && echo "Deleted load balancer $arn"
+            done
+            sleep 30
+            for arn in $(aws resourcegroupstaggingapi get-resources --resource-type-filters elasticloadbalancing:targetgroup \
+                           --tag-filters "Key=elbv2.k8s.aws/cluster,Values=$PROJECT_NAME" --query 'ResourceTagMappingList[].ResourceARN' --output text); do
+              aws elbv2 delete-target-group --target-group-arn "$arn" && echo "Deleted target group $arn"
+            done
+            for id in $(aws ec2 describe-security-groups --filters "Name=tag:elbv2.k8s.aws/cluster,Values=$PROJECT_NAME" --query 'SecurityGroups[].GroupId' --output text); do
+              for _ in 1 2 3 4 5 6; do aws ec2 delete-security-group --group-id "$id" 2>/dev/null && break; sleep 10; done
+            done
+            for id in $(aws ec2 describe-volumes --filters Name=status,Values=available "Name=tag:kubernetes.io/cluster/$PROJECT_NAME,Values=owned" \
+                          --query 'Volumes[].VolumeId' --output text); do
+              aws ec2 delete-volume --volume-id "$id" && echo "Deleted volume $id"
+            done
+            zone=$(echo "$TFVARS_JSON" | jq -r .route53_zone_id)
+            for key in api_domain argocd_domain grafana_domain; do
+              domain=$(echo "$TFVARS_JSON" | jq -r --arg k "$key" '.[$k] // empty')
+              [ -n "$domain" ] || continue
+              record=$(aws route53 list-resource-record-sets --hosted-zone-id "$zone" \
+                --query "ResourceRecordSets[?Name=='${domain}.' && Type=='A' && contains(AliasTarget.DNSName, 'elb.amazonaws.com')] | [0]" --output json)
+              [ "$record" != "null" ] || continue
+              aws route53 change-resource-record-sets --hosted-zone-id "$zone" --change-batch \
+                "$(jq -n --argjson r "$record" '{Changes: [{Action: "DELETE", ResourceRecordSet: $r}]}')" >/dev/null && echo "Deleted DNS alias $domain"
+            done
+          }
+          sweep
+      - name: Terraform destroy
+        run: terraform -chdir="$TF_DIR" destroy -input=false -lock-timeout=300s -auto-approve -no-color
+      - name: Sweep again
+        run: |
+          for arn in $(aws resourcegroupstaggingapi get-resources --resource-type-filters elasticloadbalancing:loadbalancer \
+                         --tag-filters "Key=elbv2.k8s.aws/cluster,Values=$PROJECT_NAME" --query 'ResourceTagMappingList[].ResourceARN' --output text); do
+            aws elbv2 delete-load-balancer --load-balancer-arn "$arn" || true
+          done
+      - name: Check nothing billable is left
+        run: |
+          fail=0
+          show() { if [ -n "$2" ] && [ "$2" != "None" ]; then echo "Still present - $1: $2"; fail=1; fi; }
+          show "EKS cluster" "$(aws eks list-clusters --query "clusters[?@=='$PROJECT_NAME']" --output text)"
+          show "RDS instance" "$(aws rds describe-db-instances --query "DBInstances[?DBInstanceIdentifier=='$PROJECT_NAME'].DBInstanceIdentifier" --output text)"
+          show "ElastiCache" "$(aws elasticache describe-replication-groups --query "ReplicationGroups[?ReplicationGroupId=='$PROJECT_NAME'].ReplicationGroupId" --output text 2>/dev/null)"
+          show "NAT gateway" "$(aws ec2 describe-nat-gateways --filter "Name=tag:Project,Values=$PROJECT_NAME" "Name=state,Values=available,pending" --query 'NatGateways[].NatGatewayId' --output text)"
+          show "Elastic IP" "$(aws ec2 describe-addresses --filters "Name=tag:Project,Values=$PROJECT_NAME" --query 'Addresses[].AllocationId' --output text)"
+          show "VPC" "$(aws ec2 describe-vpcs --filters "Name=tag:Project,Values=$PROJECT_NAME" --query 'Vpcs[].VpcId' --output text)"
+          show "Load balancer" "$(aws resourcegroupstaggingapi get-resources --resource-type-filters elasticloadbalancing:loadbalancer --tag-filters "Key=elbv2.k8s.aws/cluster,Values=$PROJECT_NAME" --query 'ResourceTagMappingList[].ResourceARN' --output text)"
+          show "EBS volume" "$(aws ec2 describe-volumes --filters Name=status,Values=available "Name=tag:kubernetes.io/cluster/$PROJECT_NAME,Values=owned" --query 'Volumes[].VolumeId' --output text)"
+          if [ $fail = 0 ]; then echo "No billable $PROJECT_NAME resources remain. Kept: state bucket, CI identity, hosted zone."; fi
+          exit $fail

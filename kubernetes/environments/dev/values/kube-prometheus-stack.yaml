@@ -1,0 +1,65 @@
+# One Helm release replaces the hand-written Prometheus, Grafana and operator manifests.
+# Alerts go through CloudWatch, SNS and the root-cause Lambda, so Alertmanager and the
+# node exporter stay off to save memory on the two dev nodes.
+fullnameOverride: kps
+alertmanager:
+  enabled: false
+nodeExporter:
+  enabled: false
+kubeEtcd: {enabled: false}
+kubeControllerManager: {enabled: false}
+kubeScheduler: {enabled: false}
+kubeProxy: {enabled: false}
+defaultRules:
+  rules:
+    etcd: false
+    kubeControllerManager: false
+    kubeSchedulerAlerting: false
+    kubeProxy: false
+prometheusOperator:
+  resources:
+    requests: {cpu: 20m, memory: 64Mi}
+    limits: {memory: 192Mi}
+kube-state-metrics:
+  resources:
+    requests: {cpu: 10m, memory: 48Mi}
+    limits: {memory: 128Mi}
+prometheus:
+  prometheusSpec:
+    retention: 7d
+    retentionSize: 8GB
+    # Also pick up ServiceMonitors and rules that do not carry the Helm release label.
+    serviceMonitorSelectorNilUsesHelmValues: false
+    podMonitorSelectorNilUsesHelmValues: false
+    ruleSelectorNilUsesHelmValues: false
+    resources:
+      requests: {cpu: 100m, memory: 512Mi}
+      limits: {memory: 1Gi}
+    storageSpec:
+      volumeClaimTemplate:
+        spec:
+          storageClassName: gp3
+          accessModes: [ReadWriteOnce]
+          resources:
+            requests:
+              storage: 10Gi
+grafana:
+  # The password comes from AWS Secrets Manager through the grafana-admin ExternalSecret.
+  admin:
+    existingSecret: grafana-admin
+    userKey: admin-user
+    passwordKey: admin-password
+  persistence:
+    enabled: false
+  additionalDataSources:
+  - name: Loki
+    type: loki
+    access: proxy
+    url: http://loki.monitoring.svc:3100
+  sidecar:
+    dashboards:
+      enabled: true
+      label: grafana_dashboard
+  resources:
+    requests: {cpu: 50m, memory: 128Mi}
+    limits: {memory: 256Mi}

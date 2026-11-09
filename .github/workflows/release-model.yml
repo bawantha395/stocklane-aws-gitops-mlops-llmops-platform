@@ -1,0 +1,60 @@
+name: Release approved model
+# Started by the training workflow after an automatic approval (or by hand): copies the approved
+# model to the models bucket and commits its location to the GitOps files. Argo CD rolls it out.
+on:
+  workflow_dispatch:
+    inputs:
+      model_package:
+        description: Approved Model Registry version ARN to serve
+        type: string
+        required: true
+permissions:
+  contents: write
+  id-token: write
+concurrency:
+  group: stocklane-aws
+  cancel-in-progress: false
+env:
+  AWS_REGION: ap-southeast-2
+  AWS_DEFAULT_REGION: ap-southeast-2
+  AWS_AUTH_MODE: ${{ vars.AWS_AUTH_MODE || 'oidc' }}
+  AWS_ACCOUNT_ID: ${{ vars.AWS_ACCOUNT_ID }}
+  PROJECT_NAME: stocklane-dev
+jobs:
+  release:
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    environment: aws-release
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with: {ref: main}
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with: {python-version: '3.12'}
+      - uses: ./.github/actions/aws-credentials
+        with:
+          role: github-release
+          access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+      - name: Copy the approved model and point the GitOps files at it
+        env:
+          MODEL_PACKAGE: ${{ inputs.model_package }}
+        run: |
+          pip install boto3==1.43.118
+          bucket=$(aws s3 cp "s3://${PROJECT_NAME}-automation-${AWS_ACCOUNT_ID}/outputs/dev/current.json" - | jq -r .deployment.value.model_bucket)
+          python mlops/vision/promote.py --package-arn "$MODEL_PACKAGE" --region "$AWS_REGION" --destination "s3://$bucket/releases" \
+            | jq --arg arn "$MODEL_PACKAGE" '. + {packageArn: $arn}' > /tmp/model.json
+          E=kubernetes/environments/dev
+          sed -i "s#^  MODEL_URI: .*#  MODEL_URI: \"$(jq -r .uri /tmp/model.json)\"#; s#^  MODEL_ARCHIVE_SHA256: .*#  MODEL_ARCHIVE_SHA256: \"$(jq -r .sha256 /tmp/model.json)\"#" "$E/configmap.yaml"
+          jq --slurpfile model /tmp/model.json '.model = $model[0]' "$E/release.json" > /tmp/release.json && mv /tmp/release.json "$E/release.json"
+      - name: Commit (GitOps)
+        run: |
+          git config user.name "stocklane-release"
+          git config user.email "stocklane-release@users.noreply.github.com"
+          git add kubernetes
+          git diff --cached --quiet && { echo "Nothing changed"; exit 0; }
+          git commit -m "release(dev): model ${MODEL_PACKAGE##*/} [skip ci]"
+          git pull --rebase origin main
+          git push origin HEAD:main
+        env:
+          MODEL_PACKAGE: ${{ inputs.model_package }}

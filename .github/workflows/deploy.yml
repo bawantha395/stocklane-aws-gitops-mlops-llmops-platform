@@ -1,0 +1,377 @@
+# ONE-CLICK DEPLOY: builds the complete Stocklane dev environment from nothing.
+#
+#   test ─► infrastructure ─► release ─► platform ─► frontend ─► summary
+#
+#   test            ci.yml: builds, Terraform validate, Kustomize build
+#   infrastructure  terraform plan + apply (about 25 minutes: EKS, RDS, CloudFront)
+#   release         build and push images, write this account's config into the Kustomize
+#                   files and commit them to main (GitOps)
+#   platform        a private CodeBuild job inside the VPC installs Argo CD and DNS; Argo CD
+#                   then installs everything else from the commit
+#   frontend        publish the React app to S3 and CloudFront
+#
+# Run "Destroy environment" afterwards to stop all charges.
+name: Deploy environment
+on:
+  workflow_dispatch:
+    inputs:
+      model_package:
+        description: Optional approved Model Registry version ARN to serve; empty keeps the current or baseline model
+        type: string
+        default: ''
+      allow_deletions:
+        description: Allow the plan to delete or replace resources (read the plan first)
+        type: boolean
+        default: false
+permissions:
+  contents: write
+  id-token: write
+concurrency:
+  group: stocklane-aws
+  cancel-in-progress: false
+env:
+  AWS_REGION: ap-southeast-2
+  AWS_DEFAULT_REGION: ap-southeast-2
+  AWS_AUTH_MODE: ${{ vars.AWS_AUTH_MODE || 'oidc' }}
+  AWS_ACCOUNT_ID: ${{ vars.AWS_ACCOUNT_ID }}
+  PROJECT_NAME: stocklane-dev
+  TF_DIR: infra/terraform/environments/dev
+jobs:
+  test:
+    uses: ./.github/workflows/ci.yml
+
+  infrastructure:
+    needs: test
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    environment: aws-infrastructure-apply
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: hashicorp/setup-terraform@b9cd54a3c349d3f38e8881555d616ced269862dd # v3.1.2
+        with: {terraform_version: '1.13.5', terraform_wrapper: false}
+      - uses: ./.github/actions/aws-credentials
+        with:
+          role: ci-apply
+          access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+      - name: Check the EKS node-group service-linked role exists
+        run: |
+          aws iam get-role --role-name AWSServiceRoleForAmazonEKSNodegroup --query Role.Arn --output text \
+            || { echo "::error::Run infra/ci/bootstrap.sh --execute once (it creates this role)"; exit 1; }
+      - uses: ./.github/actions/terraform
+        with:
+          tfvars-json: ${{ secrets.TFVARS_JSON }}
+      - name: Terraform plan
+        run: terraform -chdir="$TF_DIR" plan -input=false -lock-timeout=300s -out=tfplan -no-color
+      - name: Stop if the plan deletes or replaces anything that was not approved
+        env:
+          ALLOW_DELETIONS: ${{ inputs.allow_deletions }}
+        run: |
+          terraform -chdir="$TF_DIR" show -json tfplan > plan.json
+          jq -r '.resource_changes[] | select(.change.actions | index("delete")) | "\(.change.actions | join("+")) \(.address)"' plan.json | tee deletions.txt
+          {
+            echo "## Terraform plan"
+            echo "Create: $(jq '[.resource_changes[] | select(.change.actions == ["create"])] | length' plan.json), update: $(jq '[.resource_changes[] | select(.change.actions == ["update"])] | length' plan.json), delete or replace: $(wc -l < deletions.txt)"
+          } >> "$GITHUB_STEP_SUMMARY"
+          if [ -s deletions.txt ] && [ "$ALLOW_DELETIONS" != "true" ]; then
+            echo "::error::The plan deletes or replaces resources (listed above). Re-run with allow_deletions if that is intended."
+            exit 1
+          fi
+          rm plan.json
+      - name: Terraform apply
+        run: terraform -chdir="$TF_DIR" apply -input=false -lock-timeout=300s tfplan
+      - name: Publish the non-secret outputs to the private automation bucket
+        run: |
+          terraform -chdir="$TF_DIR" output -json > outputs.json
+          bucket=$(jq -r .deployment.value.automation_bucket outputs.json)
+          aws s3 cp outputs.json "s3://$bucket/outputs/dev/current.json" --sse AES256
+          rm outputs.json
+
+  release:
+    needs: infrastructure
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    environment: aws-release
+    outputs:
+      sha: ${{ steps.commit.outputs.sha }}
+    steps:
+      # Check out main (not the triggering commit) so the release commit lands on top of earlier ones.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with: {ref: main}
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with: {python-version: '3.12'}
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+      - uses: ./.github/actions/aws-credentials
+        with:
+          role: github-release
+          access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+      - name: Install Kustomize
+        run: |
+          curl -fsSL -o /tmp/kustomize.tgz https://github.com/kubernetes-sigs/kustomize/releases/download/kustomize/v5.8.3/kustomize_v5.8.3_linux_amd64.tar.gz
+          echo "cb9e31198d3f63b44848bd0afc4c8efc56e6cfef9c93a4a39a211940e6decd61  /tmp/kustomize.tgz" | sha256sum -c -
+          tar -xzf /tmp/kustomize.tgz -C /usr/local/bin kustomize
+      - name: Read this environment's Terraform outputs
+        run: |
+          aws s3 cp "s3://${PROJECT_NAME}-automation-${AWS_ACCOUNT_ID}/outputs/dev/current.json" /tmp/outputs.json
+          jq .deployment.value /tmp/outputs.json > /tmp/d.json
+          test "$(jq -r .account_id /tmp/d.json)" = "$AWS_ACCOUNT_ID"
+      - name: Sign in to ECR
+        run: aws ecr get-login-password | docker login --username AWS --password-stdin "${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com"
+      - name: Build and push the images (by digest)
+        run: |
+          tag="${GITHUB_SHA::12}-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          for pair in inventory:services/inventory workshop:services/workshop vision:services/vision forecast:services/forecast operations:services/operations ml-training:mlops/vision; do
+            name=${pair%%:*}; dir=${pair##*:}
+            repo=$(jq -r ".ecr[\"$name\"]" /tmp/d.json)
+            docker buildx build --platform linux/amd64 -f "$dir/Dockerfile" \
+              --tag "$repo:$tag" --metadata-file "/tmp/$name.json" --push .
+            echo "$repo@$(jq -r '."containerimage.digest"' "/tmp/$name.json")" > "/tmp/$name.image"
+          done
+      - name: Choose the model to serve
+        env:
+          MODEL_PACKAGE: ${{ inputs.model_package }}
+        run: |
+          bucket=$(jq -r .model_bucket /tmp/d.json)
+          current_uri=$(jq -r '.model.uri // empty' kubernetes/environments/dev/release.json 2>/dev/null || true)
+          if [ -n "$MODEL_PACKAGE" ]; then
+            pip install boto3==1.43.118
+            python mlops/vision/promote.py --package-arn "$MODEL_PACKAGE" --region "$AWS_REGION" --destination "s3://$bucket/releases" \
+              | jq --arg arn "$MODEL_PACKAGE" '. + {packageArn: $arn}' > /tmp/model.json
+          elif [ -n "$current_uri" ] && aws s3api head-object --bucket "$bucket" --key "${current_uri#"s3://$bucket/"}" >/dev/null 2>&1; then
+            jq '.model' kubernetes/environments/dev/release.json > /tmp/model.json
+          else
+            pip install onnx==1.23.2
+            python models/download_model.py
+            tar -czf /tmp/baseline.tar.gz -C models/baseline encoder.onnx model.json
+            sha=$(sha256sum /tmp/baseline.tar.gz | cut -d' ' -f1)
+            aws s3api put-object --bucket "$bucket" --key "releases/baseline/$sha.tar.gz" --body /tmp/baseline.tar.gz --if-none-match '*' >/dev/null 2>&1 || true
+            jq -n --arg uri "s3://$bucket/releases/baseline/$sha.tar.gz" --arg sha "$sha" '{uri: $uri, sha256: $sha}' > /tmp/model.json
+          fi
+          cat /tmp/model.json
+      - name: Write this account's configuration into the Kustomize files
+        run: |
+          d() { jq -r "$1" /tmp/d.json; }
+          E=kubernetes/environments/dev
+          cat > "$E/configmap.yaml" <<CONFIGMAP
+          # Written by the Deploy workflow from the Terraform outputs. Public values only, secrets stay in Secrets Manager.
+          apiVersion: v1
+          kind: ConfigMap
+          metadata:
+            name: platform-config
+            annotations:
+              argocd.argoproj.io/sync-wave: '-3'
+          data:
+            AUTH_MODE: cognito
+            ENVIRONMENT: cloud
+            SPRING_PROFILES_ACTIVE: cloud
+            AWS_REGION: "$(d .region)"
+            DEPLOYMENT_ENVIRONMENT: dev
+            COGNITO_ISSUER: "$(d .cognito_issuer)"
+            COGNITO_CLIENT_IDS: "$(d .cognito_web_client_id)"
+            APP_WEB_ORIGIN: "$(d .frontend_url)"
+            WEB_ORIGIN: "$(d .frontend_url)"
+            INVENTORY_URL: http://inventory:8081
+            WORKSHOP_URL: http://workshop:8082
+            VISION_URL: http://vision:8083
+            STOCK_QUEUE_URL: "$(d .stock_queue_url)"
+            CATALOGUE_QUEUE_URL: "$(d .catalogue_queue_url)"
+            EVENT_MODE: sqs
+            REDIS_HOST: "$(d .cache_host)"
+            REDIS_TLS: "true"
+            MEDIA_BUCKET: "$(d .media_bucket)"
+            MODEL_BUCKET: "$(d .model_bucket)"
+            MODEL_DIR: /models/current
+            MODEL_URI: "$(jq -r .uri /tmp/model.json)"
+            MODEL_ARCHIVE_SHA256: "$(jq -r .sha256 /tmp/model.json)"
+            FILES_ROOT: /tmp/files
+            BEDROCK_MODEL_ID: "$(d '.bedrock_model_id // ""')"
+            BEDROCK_REGION: "$(d '.bedrock_region // ""')"
+            BEDROCK_DAILY_REQUEST_LIMIT: "50"
+            TEXTRACT_FALLBACK: "true"
+            TRAINING_EXPORT: "true"
+            DATABASE_HOST: "$(d .database_host)"
+            MASTER_SECRET_ARN: "$(d .master_secret_arn)"
+            DATABASE_SECRETS: '{"inventory":"stocklane-dev/inventory/database","workshop":"stocklane-dev/workshop/database","vision":"stocklane-dev/vision/database"}'
+          CONFIGMAP
+          cat > "$E/ingress-patch.yaml" <<PATCH
+          - op: replace
+            path: /spec/rules/0/host
+            value: $(d .api_domain)
+          - op: add
+            path: /metadata/annotations/alb.ingress.kubernetes.io~1certificate-arn
+            value: $(d .api_certificate_arn)
+          PATCH
+          for name in inventory workshop vision forecast operations; do
+            (cd "$E" && kustomize edit set image "stocklane/$name=$(cat /tmp/$name.image)")
+          done
+          cat > "$E/values/alb-controller.yaml" <<VALUES
+          # Written by the Deploy workflow from the Terraform outputs.
+          clusterName: $(d .cluster_name)
+          region: $(d .region)
+          vpcId: $(d .vpc_id)
+          VALUES
+          sed -i -E "s#https://github.com/[^/]+/[^/.]+\.git#https://github.com/${GITHUB_REPOSITORY}.git#" kubernetes/argocd/*.yaml kubernetes/argocd/apps/*.yaml
+          jq -n --slurpfile model /tmp/model.json '{environment: "dev", model: $model[0]}
+            + {images: {inventory: "", workshop: "", vision: "", forecast: "", operations: "", "ml-training": ""}}' > "$E/release.json"
+          for name in inventory workshop vision forecast operations ml-training; do
+            jq --arg n "$name" --arg v "$(cat /tmp/$name.image)" '.images[$n] = $v' "$E/release.json" > /tmp/r.json && mv /tmp/r.json "$E/release.json"
+          done
+          if [ -n "$(d '.argocd_domain // ""')" ] || [ -n "$(d '.grafana_domain // ""')" ]; then
+            arn=$(d .admin_certificate_arn)
+            cidrs=$(d '.admin_allowed_cidrs | join(",")')
+            admin() { # name namespace host service port backend-protocol health-path
+              [ -n "$3" ] || return 0
+              cat <<INGRESS
+          ---
+          apiVersion: networking.k8s.io/v1
+          kind: Ingress
+          metadata:
+            name: admin-$1
+            namespace: $2
+            annotations:
+              alb.ingress.kubernetes.io/group.name: ${PROJECT_NAME}-admin
+              alb.ingress.kubernetes.io/scheme: internet-facing
+              alb.ingress.kubernetes.io/target-type: ip
+              alb.ingress.kubernetes.io/listen-ports: '[{"HTTPS":443}]'
+              alb.ingress.kubernetes.io/certificate-arn: $arn
+              alb.ingress.kubernetes.io/inbound-cidrs: $cidrs
+              alb.ingress.kubernetes.io/backend-protocol: $6
+              alb.ingress.kubernetes.io/healthcheck-protocol: $6
+              alb.ingress.kubernetes.io/healthcheck-path: $7
+          spec:
+            ingressClassName: alb
+            rules:
+            - host: $3
+              http:
+                paths:
+                - path: /
+                  pathType: Prefix
+                  backend:
+                    service:
+                      name: $4
+                      port:
+                        number: $5
+          INGRESS
+            }
+            { admin argocd argocd "$(d '.argocd_domain // ""')" argocd-server 443 HTTPS /healthz
+              admin grafana monitoring "$(d '.grafana_domain // ""')" kps-grafana 80 HTTP /api/health; } > kubernetes/admin/ingress.yaml
+          fi
+      - name: Check nothing is left unconfigured, and that everything builds
+        run: |
+          if grep -rn "REPLACE_" kubernetes --include=*.yaml --include=*.env --exclude-dir=base; then
+            echo "::error::Unconfigured placeholders above"; exit 1
+          fi
+          for path in kubernetes/environments/dev kubernetes/platform kubernetes/monitoring; do kustomize build "$path" > /dev/null; done
+      - id: commit
+        name: Commit the configuration (GitOps)
+        run: |
+          git config user.name "stocklane-release"
+          git config user.email "stocklane-release@users.noreply.github.com"
+          git add kubernetes
+          if git diff --cached --quiet; then
+            echo "Nothing changed"
+          else
+            git commit -m "release(dev): ${GITHUB_SHA::12} [skip ci]"
+            git pull --rebase origin main
+            git push origin HEAD:main
+          fi
+          echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
+  platform:
+    needs: release
+    runs-on: ubuntu-latest
+    timeout-minutes: 75
+    environment: aws-platform
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with: {ref: '${{ needs.release.outputs.sha }}'}
+      - uses: ./.github/actions/aws-credentials
+        with:
+          role: github-platform
+          access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+      - name: Install Argo CD and wait for the platform (private CodeBuild inside the VPC)
+        env:
+          OPERATION: bootstrap
+        run: |
+          automation="${PROJECT_NAME}-automation-${AWS_ACCOUNT_ID}"
+          aws s3 cp "s3://$automation/outputs/dev/current.json" /tmp/outputs.json
+          project=$(jq -r .deployment.value.platform_bootstrap_project /tmp/outputs.json)
+          git archive --format=zip -o /tmp/source.zip HEAD
+          mkdir -p /tmp/extra/deploy/generated && cp /tmp/outputs.json /tmp/extra/deploy/generated/aws.outputs.json
+          (cd /tmp/extra && zip -qr /tmp/source.zip deploy)
+          key="sources/dev/${GITHUB_SHA::12}-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}.zip"
+          version=$(aws s3api put-object --bucket "$automation" --key "$key" --body /tmp/source.zip --server-side-encryption AES256 --query VersionId --output text)
+          build=$(aws codebuild start-build --project-name "$project" --source-type-override S3 \
+            --source-location-override "$automation/$key" --source-version "$version" \
+            --environment-variables-override "name=STOCKLANE_OPERATION,value=$OPERATION,type=PLAINTEXT" \
+            --query build.id --output text)
+          echo "Private VPC build: $build"
+          for _ in $(seq 1 280); do
+            status=$(aws codebuild batch-get-builds --ids "$build" --query 'builds[0].buildStatus' --output text)
+            case $status in
+              SUCCEEDED) echo "Platform is ready"; exit 0;;
+              FAILED|FAULT|STOPPED|TIMED_OUT)
+                echo "::error::Platform bootstrap $status. Logs: $(aws codebuild batch-get-builds --ids "$build" --query 'builds[0].logs.deepLink' --output text)"; exit 1;;
+            esac
+            sleep 15
+          done
+          aws codebuild stop-build --id "$build" >/dev/null; echo "::error::Timed out"; exit 1
+
+  frontend:
+    needs: [release, platform]
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    environment: aws-release
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with: {ref: '${{ needs.release.outputs.sha }}'}
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: '22'
+          cache: npm
+          cache-dependency-path: apps/web/package-lock.json
+      - uses: ./.github/actions/aws-credentials
+        with:
+          role: github-release
+          access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+      - name: Build and publish the web app
+        run: |
+          aws s3 cp "s3://${PROJECT_NAME}-automation-${AWS_ACCOUNT_ID}/outputs/dev/current.json" /tmp/outputs.json
+          jq .deployment.value /tmp/outputs.json > /tmp/d.json
+          jq -c '{authMode: "cognito", authority: .cognito_issuer, clientId: .cognito_web_client_id,
+                  scope: "openid email profile", apiBase: "https://\(.api_domain)",
+                  logoutUrl: (.cognito_token_url | sub("/oauth2/token"; "/logout"))}' /tmp/d.json \
+            | sed 's/^/window.STOCKLANE_CONFIG = /; s/$/;/' > apps/web/public/config.js
+          (cd apps/web && npm ci && npm run build)
+          web=$(jq -r .web_bucket /tmp/d.json)
+          aws s3 sync apps/web/dist "s3://$web" --delete --exclude index.html --exclude config.js \
+            --cache-control 'public,max-age=31536000,immutable'
+          for file in index.html config.js; do
+            aws s3 cp "apps/web/dist/$file" "s3://$web/$file" --cache-control no-store
+          done
+          aws cloudfront create-invalidation --distribution-id "$(jq -r .cloudfront_distribution_id /tmp/d.json)" \
+            --paths /index.html /config.js / >/dev/null
+
+  summary:
+    needs: frontend
+    runs-on: ubuntu-latest
+    permissions: {}
+    steps:
+      - name: Print the environment URLs
+        env:
+          TFVARS_JSON: ${{ secrets.TFVARS_JSON }}
+        run: |
+          {
+            echo "## Stocklane dev is running"
+            echo "| | URL |"; echo "|---|---|"
+            for pair in App:web_domain API:api_domain "Argo CD:argocd_domain" Grafana:grafana_domain; do
+              url=$(echo "$TFVARS_JSON" | jq -r --arg k "${pair##*:}" '.[$k] // empty')
+              [ -z "$url" ] || echo "| ${pair%%:*} | https://$url |"
+            done
+            echo; echo "When you are done, run **Destroy environment** to stop all charges."
+          } >> "$GITHUB_STEP_SUMMARY"

@@ -1,0 +1,109 @@
+# Runs inside the VPC (private EKS endpoint). STOCKLANE_OPERATION is bootstrap or teardown.
+#   bootstrap  install Argo CD, create the root application, wait for everything to be
+#              healthy, publish the API and admin DNS aliases, probe the API
+#   teardown   stop Argo CD, release volumes and load balancers before terraform destroy
+# deploy/generated/aws.outputs.json (the Terraform outputs) is added to the source zip by the workflow.
+version: 0.2
+env:
+  shell: bash
+phases:
+  install:
+    commands:
+      - curl -fsSL -o /usr/local/bin/kubectl https://dl.k8s.io/release/v1.35.9/bin/linux/amd64/kubectl
+      - echo "3cfeaf80be482b435b0aa214aff6e0b2c312ee23c0ff20810c75517b6004c6eb  /usr/local/bin/kubectl" | sha256sum -c -
+      - chmod +x /usr/local/bin/kubectl
+  build:
+    commands:
+      - |
+        set -euo pipefail
+        D=deploy/generated/aws.outputs.json
+        d() { jq -r ".deployment.value.$1" "$D"; }
+        test "$(d account_id)" = "$EXPECTED_ACCOUNT_ID" && test "$(d name)" = "$EXPECTED_PROJECT" && test "$(d region)" = "$EXPECTED_REGION"
+        export KUBECONFIG=/tmp/kubeconfig
+        aws eks update-kubeconfig --region "$EXPECTED_REGION" --name "$(d cluster_name)" --kubeconfig "$KUBECONFIG"
+        NS=$(d workload_namespace)
+
+        if [ "$STOCKLANE_OPERATION" = "teardown" ]; then
+          # 1. Stop Argo CD so it cannot recreate anything.
+          kubectl -n argocd scale statefulset/argocd-application-controller --replicas=0 || true
+          kubectl -n argocd scale deployment/argocd-applicationset-controller --replicas=0 || true
+          # 2. Make the disks delete with their claims.
+          for pv in $(kubectl get pv -o name); do
+            kubectl patch "$pv" --type=merge -p '{"spec":{"persistentVolumeReclaimPolicy":"Delete"}}' || true
+          done
+          # 3. Ingresses and LoadBalancer services: the controller deletes the ALBs.
+          kubectl delete ingress --all -A --wait=false || true
+          for svc in $(kubectl get svc -A -o json | jq -r '.items[] | select(.spec.type=="LoadBalancer") | "\(.metadata.namespace)/\(.metadata.name)"'); do
+            kubectl -n "${svc%%/*}" delete svc "${svc##*/}" --wait=false || true
+          done
+          for _ in $(seq 1 30); do [ -z "$(kubectl get ingress -A -o name)" ] && break; sleep 10; done
+          # 4. Delete the application and monitoring namespaces so their disks are released.
+          kubectl delete namespace "$NS" monitoring --ignore-not-found --wait=false || true
+          for _ in $(seq 1 60); do [ -z "$(kubectl get pv -o name)" ] && break; sleep 10; done
+          echo "Load balancers and volumes released; the cluster can be destroyed"
+          exit 0
+        fi
+
+        # ---- bootstrap ----
+        ARGO=v3.5.6
+        curl -fsSL -o /tmp/argocd.yaml "https://raw.githubusercontent.com/argoproj/argo-cd/$ARGO/manifests/install.yaml"
+        echo "846c644bc81ce5557dd9048757a9c7353378f25c5eb811c77d32a9e907823599  /tmp/argocd.yaml" | sha256sum -c -
+        kubectl create namespace argocd --dry-run=client -o yaml | kubectl apply -f -
+        kubectl apply -n argocd --server-side --force-conflicts -f /tmp/argocd.yaml
+        for w in deployment/argocd-server deployment/argocd-repo-server deployment/argocd-redis statefulset/argocd-application-controller; do
+          kubectl -n argocd rollout status "$w" --timeout=300s
+        done
+        # An Application that only wraps child Applications reports the health of its children.
+        kubectl -n argocd patch configmap argocd-cm --type=merge -p "$(jq -n --arg lua 'hs = {status = "Progressing", message = "Waiting for child application"}
+        if obj.status ~= nil and obj.status.health ~= nil then
+          hs.status = obj.status.health.status
+          if obj.status.health.message ~= nil then hs.message = obj.status.health.message end
+        end
+        return hs
+        ' '{data: {"resource.customizations.health.argoproj.io_Application": $lua}}')"
+        kubectl apply --server-side -f kubernetes/argocd/project.yaml -f kubernetes/argocd/root.yaml
+        echo "Argo CD is running; waiting for Argo CD to install everything (up to 35 minutes)"
+
+        # Root and the app child must be Synced and Healthy.
+        for _ in $(seq 1 210); do
+          ok=1
+          for app in stocklane-root stocklane-dev; do
+            s=$(kubectl -n argocd get application "$app" -o jsonpath='{.status.sync.status}/{.status.health.status}' 2>/dev/null || true)
+            [ "$s" = "Synced/Healthy" ] || ok=0
+          done
+          [ $ok = 1 ] && break
+          sleep 10
+        done
+        [ $ok = 1 ] || { kubectl -n argocd get applications || true; echo "Argo CD did not become Synced and Healthy"; exit 1; }
+        for name in inventory workshop vision; do kubectl -n "$NS" rollout status "deployment/$name" --timeout=300s; done
+
+        # Workshop must reach Inventory through its Kubernetes Service.
+        for _ in $(seq 1 36); do
+          kubectl -n "$NS" exec deployment/workshop -- timeout 10 bash -c 'exec 3<>/dev/tcp/inventory/8081; printf "GET /actuator/health/readiness HTTP/1.1\r\nHost: inventory\r\nConnection: close\r\n\r\n" >&3; IFS= read -r s <&3; [[ "$s" == *" 200 "* ]]' && { echo "Workshop-to-Inventory readiness passed"; break; }
+          sleep 5
+        done
+
+        # Publish DNS aliases for the API and admin ingresses.
+        alias_for() { # ingress namespace domain
+          [ -n "$3" ] && [ "$3" != "null" ] || return 0
+          for _ in $(seq 1 60); do
+            host=$(kubectl -n "$2" get ingress "$1" -o jsonpath='{.status.loadBalancer.ingress[0].hostname}' 2>/dev/null || true)
+            [ -n "$host" ] && break; sleep 5
+          done
+          [ -n "$host" ] || { echo "No ALB address for $1"; exit 1; }
+          zone=$(aws elbv2 describe-load-balancers --query "LoadBalancers[?DNSName=='$host'].CanonicalHostedZoneId | [0]" --output text)
+          aws route53 change-resource-record-sets --hosted-zone-id "$(d route53_zone_id)" --change-batch "$(jq -n --arg n "$3" --arg h "$host" --arg z "$zone" \
+            '{Changes: [{Action: "UPSERT", ResourceRecordSet: {Name: $n, Type: "A", AliasTarget: {HostedZoneId: $z, DNSName: $h, EvaluateTargetHealth: true}}}]}')" > /dev/null
+          echo "DNS alias requested for $3"
+        }
+        alias_for api "$NS" "$(d api_domain)"
+        alias_for admin-argocd argocd "$(d 'argocd_domain // ""')"
+        alias_for admin-grafana monitoring "$(d 'grafana_domain // ""')"
+
+        # An unauthenticated request must reach the application (401 or 403 proves routing).
+        for _ in $(seq 1 60); do
+          code=$(curl -s -o /dev/null -w '%{http_code}' "https://$(d api_domain)/api/inventory/products" || true)
+          case $code in 200|401|403) echo "API routing is ready"; exit 0;; esac
+          sleep 10
+        done
+        echo "HTTPS API routing did not become ready"; exit 1

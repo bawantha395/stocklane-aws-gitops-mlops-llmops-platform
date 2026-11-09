@@ -1,0 +1,11 @@
+# clusterName, region and vpcId are written by the Deploy workflow from Terraform outputs.
+clusterName: REPLACE_CLUSTER_NAME
+region: REPLACE_AWS_REGION
+vpcId: REPLACE_VPC_ID
+replicaCount: 1
+serviceAccount:
+  create: true
+  name: aws-load-balancer-controller
+resources:
+  requests: {cpu: 50m, memory: 96Mi}
+  limits: {memory: 256Mi}

@@ -1,0 +1,30 @@
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: stocklane-dev
+  namespace: argocd
+  annotations:
+    argocd.argoproj.io/sync-wave: '50'
+spec:
+  project: stocklane
+  source:
+    repoURL: https://github.com/bawantha395/stocklane-aws-gitops-mlops-llmops-platform.git
+    targetRevision: main
+    path: kubernetes/environments/dev
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: stocklane-dev
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true
+    syncOptions:
+    - CreateNamespace=true
+    - SkipDryRunOnMissingResource=true
+    - ServerSideApply=true
+    retry:
+      limit: 10
+      backoff:
+        duration: 10s
+        factor: 2
+        maxDuration: 3m

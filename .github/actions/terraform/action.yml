@@ -1,0 +1,42 @@
+name: Terraform inputs and init
+description: >-
+  Writes this deployment's Terraform inputs (the TFVARS_JSON secret plus the repository
+  identity) and initialises the S3 backend. Credentials must already be configured.
+inputs:
+  tfvars-json:
+    description: The TFVARS_JSON secret
+    required: true
+runs:
+  using: composite
+  steps:
+    - name: Write the Terraform inputs
+      shell: bash
+      env:
+        TFVARS_JSON: ${{ inputs.tfvars-json }}
+        REPO_ID: ${{ github.repository_id }}
+        OWNER_ID: ${{ github.repository_owner_id }}
+      run: |
+        for value in $(echo "$TFVARS_JSON" | jq -r '.budget_email, (.operator_cidrs[]?), (.admin_allowed_cidrs[]?)'); do
+          echo "::add-mask::$value"
+        done
+        echo "$TFVARS_JSON" | jq \
+          --arg region "$AWS_REGION" --arg name "$PROJECT_NAME" --arg repo "$GITHUB_REPOSITORY" \
+          --arg repo_id "$REPO_ID" --arg owner_id "$OWNER_ID" --arg mode "$AWS_AUTH_MODE" --arg account "$AWS_ACCOUNT_ID" '
+          . + {region: $region, name: $name, environment: "dev",
+               github_repository: $repo, github_repository_id: $repo_id, github_owner_id: $owner_id,
+               github_auth_mode: $mode,
+               github_ci_user_arn: (if $mode == "access-key" then "arn:aws:iam::\($account):user/\($name)-github-ci" else null end),
+               github_oidc_provider_arn: (if $mode == "oidc" then "arn:aws:iam::\($account):oidc-provider/token.actions.githubusercontent.com" else "" end),
+               workload_permissions_boundary_arn: "arn:aws:iam::\($account):policy/\($name)-workload-boundary",
+               github_oidc_subject_style: (.github_oidc_subject_style // "immutable")}' \
+          > "$TF_DIR/pipeline.auto.tfvars.json"
+        chmod 600 "$TF_DIR/pipeline.auto.tfvars.json"
+    - name: Terraform init
+      shell: bash
+      run: |
+        terraform -chdir="$TF_DIR" init -input=false -reconfigure \
+          -backend-config="bucket=${PROJECT_NAME}-tfstate-${AWS_ACCOUNT_ID}-${AWS_REGION}" \
+          -backend-config="key=state/dev/terraform.tfstate" \
+          -backend-config="region=${AWS_REGION}" \
+          -backend-config="encrypt=true" -backend-config="use_lockfile=true"
+        terraform -chdir="$TF_DIR" validate
